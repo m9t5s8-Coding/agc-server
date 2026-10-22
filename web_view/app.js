@@ -2,7 +2,7 @@
  * AGC Explorer - Compiler & IR Viewer UI Client
  * 
  * Workflow:
- * 1. User inputs custom AGC code in the left editor (main.agc).
+ * 1. User inputs custom AGC code in the left editor (main.ag).
  * 2. User clicks "Run" (or Ctrl+Enter).
  * 3. The code is sent via HTTP POST to the user's C++ server.
  * 4. The C++ server runs the compiler, produces the output file (out.ir),
@@ -31,6 +31,17 @@ const CONFIG = {
   fontSize: 15,
   syncScroll: true
 };
+
+// Restore saved settings from localStorage
+try {
+  const savedCfg = localStorage.getItem('agc_config');
+  if (savedCfg) {
+    const parsed = JSON.parse(savedCfg);
+    if (parsed && typeof parsed === 'object') {
+      Object.assign(CONFIG, parsed);
+    }
+  }
+} catch (_) { }
 
 // Initial starter code in the custom input editor
 const STARTER_CODE = `func main() -> int {
@@ -98,6 +109,54 @@ function registerLanguages(monaco) {
         [/->|==|<=|>=|!=|[:+\-*\/%=<>!]/, 'operator'],
         [/[;,.]/, 'delimiter'],
       ]
+    }
+  });
+
+  // AGC Language Configuration (Brackets, Comments, Auto-closing pairs)
+  monaco.languages.setLanguageConfiguration('agc', {
+    comments: {
+      lineComment: '#'
+    },
+    brackets: [
+      ['{', '}'],
+      ['[', ']'],
+      ['(', ')']
+    ],
+    autoClosingPairs: [
+      { open: '{', close: '}' },
+      { open: '[', close: ']' },
+      { open: '(', close: ')' },
+      { open: '"', close: '"', notIn: ['string'] },
+      { open: "'", close: "'", notIn: ['string', 'comment'] }
+    ],
+    surroundingPairs: [
+      { open: '{', close: '}' },
+      { open: '[', close: ']' },
+      { open: '(', close: ')' },
+      { open: '"', close: '"' },
+      { open: "'", close: "'" }
+    ],
+    indentationRules: {
+      increaseIndentPattern: /^.*\{[^}"']*$/,
+      decreaseIndentPattern: /^.*\}[^}"']*$/
+    },
+    onEnterRules: [
+      {
+        beforeText: /^\s*.*\{\s*$/,
+        afterText: /^\s*\}.*$/,
+        action: { indentAction: monaco.languages.IndentAction.IndentOutdent }
+      }
+    ]
+  });
+
+  // Register document formatting provider for AGC
+  monaco.languages.registerDocumentFormattingEditProvider('agc', {
+    provideDocumentFormattingEdits(model) {
+      const formatted = formatAgcCode(model.getValue());
+      return [{
+        range: model.getFullModelRange(),
+        text: formatted
+      }];
     }
   });
 
@@ -300,12 +359,74 @@ let isRunning = false;
 let files = [
   {
     id: 'file-1',
-    name: 'main.agc',
+    name: 'main.ag',
     content: STARTER_CODE
   }
 ];
 let activeFileId = 'file-1';
 const fileModels = new Map();
+const localFileHandles = new Map();
+
+// Load saved files and active tab from localStorage
+try {
+  const savedFiles = localStorage.getItem('agc_files');
+  if (savedFiles) {
+    const parsed = JSON.parse(savedFiles);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      files = parsed.map(f => {
+        if (f.name && f.name.endsWith('.agc')) {
+          f.name = f.name.replace(/\.agc$/, '.ag');
+        }
+        return f;
+      });
+    }
+  }
+  const savedActiveId = localStorage.getItem('agc_active_file_id');
+  if (savedActiveId && files.some(f => f.id === savedActiveId)) {
+    activeFileId = savedActiveId;
+  } else if (files.length > 0) {
+    activeFileId = files[0].id;
+  }
+} catch (_) { }
+
+let localStorageTimer = null;
+function scheduleSaveLocalStorage(immediate = false) {
+  if (immediate) {
+    if (localStorageTimer) clearTimeout(localStorageTimer);
+    saveToLocalStorage();
+    return;
+  }
+  if (localStorageTimer) clearTimeout(localStorageTimer);
+  localStorageTimer = setTimeout(() => {
+    saveToLocalStorage();
+  }, 300);
+}
+
+function saveToLocalStorage() {
+  try {
+    const activeFile = getActiveFile();
+    if (editorLeft && editorLeft.getValue && activeFile) {
+      activeFile.content = editorLeft.getValue();
+    }
+    localStorage.setItem('agc_files', JSON.stringify(files));
+    localStorage.setItem('agc_active_file_id', activeFileId);
+    saveConfigToLocalStorage();
+  } catch (err) {
+    console.warn('Failed to save to localStorage:', err);
+  }
+}
+
+function saveConfigToLocalStorage() {
+  try {
+    localStorage.setItem('agc_config', JSON.stringify({
+      serverUrl: CONFIG.serverUrl,
+      requestFormat: CONFIG.requestFormat,
+      autoRun: CONFIG.autoRun,
+      syncScroll: CONFIG.syncScroll,
+      fontSize: CONFIG.fontSize
+    }));
+  } catch (_) { }
+}
 
 function getActiveFile() {
   return files.find(f => f.id === activeFileId) || files[0];
@@ -320,6 +441,7 @@ function getOrCreateFileModel(file) {
     model.onDidChangeContent(() => {
       file.content = model.getValue();
       updateCodeStats();
+      scheduleSaveLocalStorage();
       if (CONFIG.autoRun) {
         clearTimeout(autoRunTimer);
         autoRunTimer = setTimeout(() => {
@@ -368,9 +490,10 @@ function renderTabs() {
         finished = true;
         let val = input.value.trim();
         if (!val) val = currentName;
-        if (!val.endsWith('.agc')) val += '.agc';
+        if (!val.endsWith('.ag')) val += '.ag';
         file.name = val;
         renderTabs();
+        scheduleSaveLocalStorage(true);
       };
 
       input.addEventListener('blur', finishRename);
@@ -438,18 +561,19 @@ function switchToFile(fileId) {
 
   renderTabs();
   updateCodeStats();
+  scheduleSaveLocalStorage();
 }
 
 function addNewFile(customName, initialContent) {
   let counter = files.length + 1;
   let name = customName;
   if (!name) {
-    while (files.some(f => f.name === `file${counter}.agc`)) {
+    while (files.some(f => f.name === `file${counter}.ag`)) {
       counter++;
     }
-    name = `file${counter}.agc`;
+    name = `file${counter}.ag`;
   }
-  if (!name.endsWith('.agc')) name += '.agc';
+  if (!name.endsWith('.ag')) name += '.ag';
 
   const defaultContent = initialContent || `func helper_${counter}() -> int {\n    return ${counter};\n}\n`;
   const newFile = {
@@ -459,6 +583,7 @@ function addNewFile(customName, initialContent) {
   };
   files.push(newFile);
   switchToFile(newFile.id);
+  scheduleSaveLocalStorage(true);
   showToast(`Created ${name}`);
 }
 
@@ -470,6 +595,7 @@ function closeFile(fileId) {
   const idx = files.findIndex(f => f.id === fileId);
   if (idx === -1) return;
   const removed = files.splice(idx, 1)[0];
+  localFileHandles.delete(fileId);
   if (fileModels.has(fileId)) {
     try { fileModels.get(fileId).dispose(); } catch (_) { }
     fileModels.delete(fileId);
@@ -480,7 +606,521 @@ function closeFile(fileId) {
   } else {
     renderTabs();
   }
+  scheduleSaveLocalStorage(true);
   showToast(`Closed ${removed.name}`);
+}
+
+// ============================================================================
+// 3.1 CODE FORMATTER FOR AGC
+// ============================================================================
+function formatLineCode(codePart) {
+  const strings = [];
+  let s = codePart.replace(/"(?:[^"\\]|\\.)*"/g, (m) => {
+    strings.push(m);
+    return `__AGC_STR_${strings.length - 1}__`;
+  });
+
+  // Normalize colons: no space before, one space after
+  s = s.replace(/\s*:\s*/g, ': ');
+  // Normalize arrows
+  s = s.replace(/\s*->\s*/g, ' -> ');
+  // Normalize commas
+  s = s.replace(/\s*,\s*/g, ', ');
+  // Normalize semicolons
+  s = s.replace(/\s*;\s*/g, ';');
+
+  // Space before {
+  s = s.replace(/([^\s])\{/g, '$1 {');
+
+  // Multi-character operators
+  const multiOps = ['==', '!=', '<=', '>=', '&&', '||', '<<', '>>'];
+  for (const op of multiOps) {
+    const escaped = op.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    s = s.replace(new RegExp('\\s*' + escaped + '\\s*', 'g'), ` ${op} `);
+  }
+
+  // Single character operators
+  s = s.replace(/([^=!<>+\-*/&|^%])=([^=])/g, '$1 = $2');
+  s = s.replace(/([\w\)])\+([\w\(])/g, '$1 + $2');
+  s = s.replace(/([\w\)])\*([\w\(])/g, '$1 * $2');
+  s = s.replace(/([\w\)])\/([\w\(])/g, '$1 / $2');
+  s = s.replace(/([\w\)])%([\w\(])/g, '$1 % $2');
+  s = s.replace(/([\w\)])-([^\s>])/g, '$1 - $2');
+  s = s.replace(/([^<])<([^<=<])/g, '$1 < $2');
+  s = s.replace(/([^->])>([^=>])/g, '$1 > $2');
+
+  // Normalize multiple spaces
+  s = s.replace(/[ \t]+/g, ' ');
+
+  // Spacing inside and around parentheses
+  s = s.replace(/\(\s+/g, '(');
+  s = s.replace(/\s+\)/g, ')');
+  s = s.replace(/\s+\(/g, '(');
+  s = s.replace(/\b(if|while|for|return)\(/g, '$1 (');
+  s = s.replace(/\belse\s+if\(/g, 'else if (');
+
+  // Format "} else {" and "} else if (...) {"
+  s = s.replace(/\}\s*else\s*\{/g, '} else {');
+  s = s.replace(/\}\s*else\s+if\s*\(/g, '} else if (');
+
+  // Restore string literals
+  for (let i = 0; i < strings.length; i++) {
+    s = s.replace(`__AGC_STR_${i}__`, strings[i]);
+  }
+
+  return s.trim();
+}
+
+function formatAgcCode(code) {
+  if (!code) return '';
+  const lines = code.split('\n');
+  const formattedLines = [];
+  let indentLevel = 0;
+  const indentStr = '    '; // 4 spaces indent
+  let lastWasEmpty = false;
+
+  for (let rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      if (!lastWasEmpty && formattedLines.length > 0) {
+        formattedLines.push('');
+        lastWasEmpty = true;
+      }
+      continue;
+    }
+    lastWasEmpty = false;
+
+    // Separate comment if exists outside of string
+    let codePart = trimmed;
+    let commentPart = '';
+    let inString = false;
+    let commentIndex = -1;
+
+    for (let i = 0; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (ch === '"' && (i === 0 || trimmed[i - 1] !== '\\')) {
+        inString = !inString;
+      } else if (ch === '#' && !inString) {
+        commentIndex = i;
+        break;
+      }
+    }
+
+    if (commentIndex !== -1) {
+      codePart = trimmed.substring(0, commentIndex).trim();
+      commentPart = trimmed.substring(commentIndex);
+      if (commentPart.startsWith('#') && commentPart.length > 1 && commentPart[1] !== ' ' && commentPart[1] !== '#') {
+        commentPart = '# ' + commentPart.substring(1);
+      }
+    }
+
+    const formattedCode = codePart ? formatLineCode(codePart) : '';
+
+    // Count braces outside of strings
+    let openCount = 0;
+    let closeCount = 0;
+    let inStr = false;
+    for (let i = 0; i < codePart.length; i++) {
+      const ch = codePart[i];
+      if (ch === '"' && (i === 0 || codePart[i - 1] !== '\\')) {
+        inStr = !inStr;
+      } else if (!inStr) {
+        if (ch === '{') openCount++;
+        else if (ch === '}') closeCount++;
+      }
+    }
+
+    // Lines starting with '}' should be unindented for that line
+    const startsWithClose = formattedCode.startsWith('}');
+    if (startsWithClose) {
+      indentLevel = Math.max(0, indentLevel - 1);
+    }
+
+    const currentIndent = indentStr.repeat(indentLevel);
+    let finalLine = '';
+    if (formattedCode && commentPart) {
+      finalLine = currentIndent + formattedCode + '  ' + commentPart;
+    } else if (formattedCode) {
+      finalLine = currentIndent + formattedCode;
+    } else {
+      finalLine = currentIndent + commentPart;
+    }
+
+    formattedLines.push(finalLine);
+
+    if (startsWithClose) {
+      indentLevel = Math.max(0, indentLevel + openCount - (closeCount - 1));
+    } else {
+      indentLevel = Math.max(0, indentLevel + openCount - closeCount);
+    }
+  }
+
+  return formattedLines.join('\n');
+}
+
+function formatCurrentFile() {
+  const activeFile = getActiveFile();
+  if (!activeFile) return;
+
+  const currentCode = (editorLeft && editorLeft.getValue) ? editorLeft.getValue() : activeFile.content;
+  const formatted = formatAgcCode(currentCode);
+
+  if (formatted === currentCode) {
+    showToast('Code is already formatted', 'info');
+    return;
+  }
+
+  if (editorLeft && editorLeft.executeEdits && editorLeft.getModel) {
+    const model = editorLeft.getModel();
+    editorLeft.executeEdits('formatDocument', [{
+      range: model.getFullModelRange(),
+      text: formatted
+    }]);
+  } else if (editorLeft && editorLeft.setValue) {
+    editorLeft.setValue(formatted);
+  }
+
+  activeFile.content = formatted;
+  updateCodeStats();
+  scheduleSaveLocalStorage(true);
+  showToast('Code formatted!', 'success');
+  logConsole(`[Format] Formatted ${activeFile.name}`, 'dim');
+}
+
+// ============================================================================
+// 3.2 COMMENT SHORTCUT FEATURE (SINGLE & MULTI-LINE)
+// ============================================================================
+function toggleCommentOnEditor() {
+  if (!editorLeft) return;
+
+  if (editorLeft.executeEdits && editorLeft.getSelection && editorLeft.getModel) {
+    const selection = editorLeft.getSelection();
+    const model = editorLeft.getModel();
+    if (!selection || !model) return;
+
+    let startLine = selection.startLineNumber;
+    let endLine = selection.endLineNumber;
+
+    if (endLine > startLine && selection.endColumn === 1) {
+      endLine = endLine - 1;
+    }
+
+    let allCommented = true;
+    let hasNonEmpty = false;
+    for (let lineNum = startLine; lineNum <= endLine; lineNum++) {
+      const lineContent = model.getLineContent(lineNum);
+      const trimmed = lineContent.trim();
+      if (trimmed.length > 0) {
+        hasNonEmpty = true;
+        if (!trimmed.startsWith('#')) {
+          allCommented = false;
+          break;
+        }
+      }
+    }
+    if (!hasNonEmpty) allCommented = false;
+
+    const edits = [];
+    for (let lineNum = startLine; lineNum <= endLine; lineNum++) {
+      const lineContent = model.getLineContent(lineNum);
+      const trimmed = lineContent.trim();
+
+      if (allCommented) {
+        // Uncomment: remove leading '# ' or '#'
+        const match = lineContent.match(/^(\s*)#\s?(.*)$/);
+        if (match) {
+          const newText = match[1] + match[2];
+          edits.push({
+            range: new monaco.Range(lineNum, 1, lineNum, lineContent.length + 1),
+            text: newText
+          });
+        }
+      } else {
+        // Comment: insert '# '
+        if (trimmed.length > 0 || startLine === endLine) {
+          const match = lineContent.match(/^(\s*)(.*)$/);
+          const indent = match ? match[1] : '';
+          const rest = match ? match[2] : lineContent;
+          const newText = indent + '# ' + rest;
+          edits.push({
+            range: new monaco.Range(lineNum, 1, lineNum, lineContent.length + 1),
+            text: newText
+          });
+        }
+      }
+    }
+
+    if (edits.length > 0) {
+      editorLeft.executeEdits('toggleComment', edits);
+      const activeFile = getActiveFile();
+      if (activeFile) {
+        activeFile.content = editorLeft.getValue();
+        scheduleSaveLocalStorage();
+      }
+    }
+  } else if (editorLeft.getValue) {
+    toggleCommentFallbackTextarea();
+  }
+}
+
+function toggleCommentFallbackTextarea() {
+  const ta = document.querySelector('#editor-left textarea');
+  if (!ta) return;
+
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const val = ta.value;
+
+  const startLineIdx = val.lastIndexOf('\n', start - 1) + 1;
+  let endLineIdx = val.indexOf('\n', end);
+  if (endLineIdx === -1) endLineIdx = val.length;
+
+  const selectedLinesText = val.substring(startLineIdx, endLineIdx);
+  const lines = selectedLinesText.split('\n');
+
+  let allCommented = true;
+  let hasNonEmpty = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.length > 0) {
+      hasNonEmpty = true;
+      if (!trimmed.startsWith('#')) {
+        allCommented = false;
+        break;
+      }
+    }
+  }
+  if (!hasNonEmpty) allCommented = false;
+
+  const newLines = lines.map(line => {
+    if (allCommented) {
+      return line.replace(/^(\s*)#\s?/, '$1');
+    } else {
+      if (line.trim().length > 0 || lines.length === 1) {
+        return line.replace(/^(\s*)(.*)$/, '$1# $2');
+      }
+      return line;
+    }
+  });
+
+  const replaced = newLines.join('\n');
+  ta.value = val.substring(0, startLineIdx) + replaced + val.substring(endLineIdx);
+  ta.selectionStart = startLineIdx;
+  ta.selectionEnd = startLineIdx + replaced.length;
+
+  const activeFile = getActiveFile();
+  if (activeFile) {
+    activeFile.content = ta.value;
+    scheduleSaveLocalStorage();
+  }
+  updateCodeStats();
+}
+
+// ============================================================================
+// 3.3 INTELLIGENT BRACKET CLOSE DETECTION
+// ============================================================================
+function hasUnmatchedClose(textAfter, openChar, closeChar) {
+  let depth = 0;
+  let inStr = false;
+  for (let i = 0; i < textAfter.length; i++) {
+    const ch = textAfter[i];
+    if (ch === '"' && (i === 0 || textAfter[i - 1] !== '\\')) {
+      inStr = !inStr;
+    } else if (!inStr) {
+      if (ch === '#') break; // Comments ignore rest of line
+      if (ch === closeChar) {
+        if (depth > 0) {
+          depth--;
+        } else {
+          return true; // Found unmatched closing bracket
+        }
+      } else if (ch === openChar) {
+        depth++;
+      }
+    }
+  }
+  return false;
+}
+
+// ============================================================================
+// 3.4 LOCAL FILE ACCESS (SAVE / OPEN / FILE SYSTEM API)
+// ============================================================================
+async function saveActiveFile(forcePicker = false) {
+  const activeFile = getActiveFile();
+  if (!activeFile) return;
+
+  if (editorLeft && editorLeft.getValue) {
+    activeFile.content = editorLeft.getValue();
+  }
+
+  scheduleSaveLocalStorage(true);
+
+  let handle = localFileHandles.get(activeFile.id);
+
+  // If handle already exists and not forcing picker, write directly to that local file!
+  if (handle && !forcePicker) {
+    try {
+      if (handle.queryPermission) {
+        const perm = await handle.queryPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          const req = await handle.requestPermission({ mode: 'readwrite' });
+          if (req !== 'granted') {
+            throw new Error('Permission denied to write to local file');
+          }
+        }
+      }
+      const writable = await handle.createWritable();
+      await writable.write(activeFile.content);
+      await writable.close();
+      activeFile.isSaved = true;
+      showToast(`Saved to ${handle.name || activeFile.name}!`, 'success');
+      logConsole(`[Save] Written directly to disk: ${handle.name || activeFile.name}`, 'success');
+      return;
+    } catch (err) {
+      logConsole(`[Save Warning] Could not write to handle: ${err.message}`, 'warn');
+    }
+  }
+
+  // If no handle or write failed, try showSaveFilePicker
+  if (window.showSaveFilePicker) {
+    try {
+      handle = await window.showSaveFilePicker({
+        suggestedName: activeFile.name,
+        types: [{
+          description: 'AGC Source File (*.ag)',
+          accept: { 'text/plain': ['.ag', '.agc', '.txt', '.ir'] }
+        }]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(activeFile.content);
+      await writable.close();
+
+      localFileHandles.set(activeFile.id, handle);
+      if (handle.name && handle.name !== activeFile.name) {
+        activeFile.name = handle.name;
+        renderTabs();
+      }
+      activeFile.isSaved = true;
+      scheduleSaveLocalStorage(true);
+      showToast(`Saved to ${handle.name}!`, 'success');
+      logConsole(`[Save] File saved locally to disk: ${handle.name}`, 'success');
+      return;
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        return; // User cancelled save dialog
+      }
+      logConsole(`[Save] showSaveFilePicker failed: ${err.message}. Falling back to browser download.`, 'dim');
+    }
+  }
+
+  // Graceful fallback: download file
+  downloadFile(activeFile.name, activeFile.content);
+  activeFile.isSaved = true;
+  scheduleSaveLocalStorage(true);
+}
+
+async function openFileFromDisk() {
+  if (window.showOpenFilePicker) {
+    try {
+      const [handle] = await window.showOpenFilePicker({
+        multiple: false,
+        types: [{
+          description: 'AGC Files / Text Files (*.ag, *.agc, *.txt, *.ir, *)',
+          accept: {
+            'text/plain': ['.ag', '.agc', '.txt', '.ir', '.c', '.cpp', '.*']
+          }
+        }]
+      });
+      const fileObj = await handle.getFile();
+      const content = await fileObj.text();
+      loadOpenedFile(fileObj.name, content, handle);
+      return;
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      logConsole(`[Open] showOpenFilePicker: ${err.message}. Using fallback.`, 'dim');
+    }
+  }
+
+  // Fallback: file input element
+  openFileViaInput();
+}
+
+function openFileViaInput() {
+  let input = document.getElementById('file-input-fallback');
+  if (!input) {
+    input = document.createElement('input');
+    input.id = 'file-input-fallback';
+    input.type = 'file';
+    input.accept = '.ag,.agc,.txt,.ir,*/*';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+  }
+  input.value = '';
+  input.onchange = () => {
+    if (input.files && input.files[0]) {
+      const fileObj = input.files[0];
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        loadOpenedFile(fileObj.name, e.target.result, null);
+      };
+      reader.readAsText(fileObj);
+    }
+  };
+  input.click();
+}
+
+function loadOpenedFile(name, content, handle) {
+  const activeFile = getActiveFile();
+  const isStarterOrEmpty = files.length === 1 &&
+    (!activeFile.content.trim() || activeFile.content === STARTER_CODE);
+
+  if (isStarterOrEmpty) {
+    activeFile.name = name;
+    activeFile.content = content;
+    if (handle) localFileHandles.set(activeFile.id, handle);
+    if (fileModels.has(activeFile.id)) {
+      fileModels.get(activeFile.id).setValue(content);
+    }
+    if (editorLeft && editorLeft.setValue) {
+      editorLeft.setValue(content);
+    }
+    renderTabs();
+    updateCodeStats();
+    showToast(`Loaded ${name}`, 'success');
+    logConsole(`[Open] Loaded ${name} (${content.length} bytes)`, 'success');
+    scheduleSaveLocalStorage(true);
+    return;
+  }
+
+  // Check if a file with same name already exists
+  const existing = files.find(f => f.name === name);
+  if (existing) {
+    existing.content = content;
+    if (handle) localFileHandles.set(existing.id, handle);
+    if (fileModels.has(existing.id)) {
+      fileModels.get(existing.id).setValue(content);
+    }
+    switchToFile(existing.id);
+    showToast(`Reloaded ${name}`, 'success');
+    logConsole(`[Open] Reloaded ${name}`, 'success');
+    scheduleSaveLocalStorage(true);
+    return;
+  }
+
+  // Add new file tab
+  const newFile = {
+    id: 'file-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+    name: name,
+    content: content
+  };
+  files.push(newFile);
+  if (handle) {
+    localFileHandles.set(newFile.id, handle);
+  }
+  switchToFile(newFile.id);
+  showToast(`Loaded ${name}`, 'success');
+  logConsole(`[Open] Opened ${name} into new tab`, 'success');
+  scheduleSaveLocalStorage(true);
 }
 
 function getCombinedSourceCode() {
@@ -498,7 +1138,7 @@ function getCombinedSourceCode() {
   const mainFiles = [];
 
   files.forEach(f => {
-    if (f.name === 'main.agc' || f.content.includes('func main')) {
+    if (f.name === 'main.ag' || f.name === 'main.agc' || f.content.includes('func main')) {
       mainFiles.push(f);
     } else {
       otherFiles.push(f);
@@ -592,7 +1232,7 @@ async function checkServerHealth() {
 
 function highlightErrorInEditor(errorMsg) {
   if (!editorLeft || typeof monaco === 'undefined') return;
-  const match = errorMsg.match(/([a-zA-Z0-9_.\-\/\\]+\.(agc|sj)):(\\d+)(?::(\\d+))?:?\\s*(.*)/i);
+  const match = errorMsg.match(/([a-zA-Z0-9_.\-\/\\]+\.(ag|agc|sj)):(\d+)(?::(\d+))?:?\s*(.*)/i);
   if (match) {
     const errorFile = match[1].split('/').pop().split('\\').pop();
     const line = parseInt(match[3], 10);
@@ -827,12 +1467,17 @@ function initSplitter() {
       document.body.style.userSelect = '';
       if (editorLeft) editorLeft.layout();
       if (editorRight) editorRight.layout();
+      try {
+        const leftPct = parseFloat(paneLeft.style.flex.replace('0 0 ', '').replace('%', ''));
+        if (!isNaN(leftPct)) localStorage.setItem('agc_splitter_pos', leftPct);
+      } catch (_) { }
     }
   });
 
   splitter.addEventListener('dblclick', () => {
     paneLeft.style.flex = '1';
     paneRight.style.flex = '1';
+    try { localStorage.removeItem('agc_splitter_pos'); } catch (_) { }
     if (editorLeft) editorLeft.layout();
     if (editorRight) editorRight.layout();
     showToast('Reset split panes to 50/50');
@@ -884,7 +1529,16 @@ function initMonaco() {
       renderWhitespace: 'selection',
       cursorBlinking: 'smooth',
       smoothScrolling: true,
-      tabSize: 2,
+      tabSize: 4,
+      insertSpaces: true,
+      autoClosingBrackets: 'always',
+      autoClosingQuotes: 'always',
+      autoClosingDelete: 'always',
+      autoClosingOvertype: 'always',
+      autoSurround: 'languageDefined',
+      matchBrackets: 'always',
+      bracketPairColorization: { enabled: true },
+      formatOnPaste: true,
       minimap: { enabled: true, maxColumn: 40, renderCharacters: false }
     };
 
@@ -912,6 +1566,114 @@ function initMonaco() {
     applyTheme(currentTheme);
     renderTabs();
 
+    // Intelligent bracket insertion & overtyping
+    editorLeft.onKeyDown((e) => {
+      const bracketPairs = {
+        '(': ')',
+        '{': '}',
+        '[': ']'
+      };
+      const closeToOpen = {
+        ')': '(',
+        '}': '{',
+        ']': '['
+      };
+
+      const key = e.browserEvent ? e.browserEvent.key : null;
+      if (!key) return;
+
+      // When opening bracket is inserted
+      if (bracketPairs[key]) {
+        const selection = editorLeft.getSelection();
+        if (selection && selection.isEmpty()) {
+          const pos = selection.getPosition();
+          const model = editorLeft.getModel();
+          const line = model.getLineContent(pos.lineNumber);
+          const textAfter = line.substring(pos.column - 1);
+          const openChar = key;
+          const closeChar = bracketPairs[key];
+
+          const hasClose = hasUnmatchedClose(textAfter, openChar, closeChar);
+
+          e.preventDefault();
+          e.stopPropagation();
+
+          if (hasClose) {
+            // Equivalent close is ALREADY there: insert ONLY the open bracket
+            editorLeft.executeEdits('autoClose', [{
+              range: new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column),
+              text: openChar
+            }]);
+            editorLeft.setPosition({ lineNumber: pos.lineNumber, column: pos.column + 1 });
+          } else {
+            // Equivalent close is NOT there: insert both open and close brackets
+            editorLeft.executeEdits('autoClose', [{
+              range: new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column),
+              text: openChar + closeChar
+            }]);
+            editorLeft.setPosition({ lineNumber: pos.lineNumber, column: pos.column + 1 });
+          }
+          return;
+        }
+      }
+
+      // When closing bracket is typed and it's already there right after cursor: step over
+      if (closeToOpen[key]) {
+        const selection = editorLeft.getSelection();
+        if (selection && selection.isEmpty()) {
+          const pos = selection.getPosition();
+          const model = editorLeft.getModel();
+          const line = model.getLineContent(pos.lineNumber);
+          if (line[pos.column - 1] === key) {
+            e.preventDefault();
+            e.stopPropagation();
+            editorLeft.setPosition({ lineNumber: pos.lineNumber, column: pos.column + 1 });
+            return;
+          }
+        }
+      }
+    });
+
+    // Monaco Actions (Save, Open, Comment, Format)
+    editorLeft.addAction({
+      id: 'save-active-file-cmd',
+      label: 'Save File to Disk',
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
+      run: () => {
+        saveActiveFile();
+      }
+    });
+
+    editorLeft.addAction({
+      id: 'open-file-disk-cmd',
+      label: 'Open File from Disk',
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO],
+      run: () => {
+        openFileFromDisk();
+      }
+    });
+
+    editorLeft.addAction({
+      id: 'toggle-line-comment-cmd',
+      label: 'Toggle Line Comment',
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Slash],
+      run: () => {
+        toggleCommentOnEditor();
+      }
+    });
+
+    editorLeft.addAction({
+      id: 'format-agc-code-cmd',
+      label: 'Format AGC Document',
+      keybindings: [
+        monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
+        monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyI
+      ],
+      run: () => {
+        formatCurrentFile();
+      }
+    });
+
     // Update cursor position and length live
     editorLeft.onDidChangeCursorPosition((e) => {
       const posDisplay = document.getElementById('cursor-pos');
@@ -922,6 +1684,7 @@ function initMonaco() {
 
     editorLeft.onDidChangeModelContent(() => {
       updateCodeStats();
+      scheduleSaveLocalStorage();
       if (!CONFIG.autoRun) return;
       clearTimeout(autoRunTimer);
       autoRunTimer = setTimeout(() => {
@@ -958,7 +1721,8 @@ function initFallbackTextareas() {
 
   const taLeft = document.createElement('textarea');
   taLeft.style.cssText = 'width:100%;height:100%;background:#1e1e1e;color:#d4d4d4;font-family:monospace;padding:12px;border:none;resize:none;outline:none;font-size:13px;line-height:1.5;';
-  taLeft.value = STARTER_CODE;
+  const activeFile = getActiveFile();
+  taLeft.value = activeFile ? activeFile.content : STARTER_CODE;
   leftContainer.appendChild(taLeft);
 
   const taRight = document.createElement('textarea');
@@ -974,6 +1738,7 @@ function initFallbackTextareas() {
       const f = getActiveFile();
       if (f) f.content = v;
       updateCodeStats();
+      scheduleSaveLocalStorage();
     },
     layout: () => { }
   };
@@ -986,10 +1751,49 @@ function initFallbackTextareas() {
 
   renderTabs();
 
+  // Auto-close brackets for textarea fallback
+  taLeft.addEventListener('keydown', (e) => {
+    const bracketPairs = { '(': ')', '{': '}', '[': ']' };
+    if (bracketPairs[e.key]) {
+      const start = taLeft.selectionStart;
+      const end = taLeft.selectionEnd;
+      if (start === end) {
+        const val = taLeft.value;
+        const textAfter = val.substring(start).split('\n')[0];
+        const openChar = e.key;
+        const closeChar = bracketPairs[openChar];
+        const hasClose = hasUnmatchedClose(textAfter, openChar, closeChar);
+
+        e.preventDefault();
+        if (hasClose) {
+          taLeft.value = val.substring(0, start) + openChar + val.substring(end);
+          taLeft.selectionStart = taLeft.selectionEnd = start + 1;
+        } else {
+          taLeft.value = val.substring(0, start) + openChar + closeChar + val.substring(end);
+          taLeft.selectionStart = taLeft.selectionEnd = start + 1;
+        }
+        const f = getActiveFile();
+        if (f) f.content = taLeft.value;
+        updateCodeStats();
+        scheduleSaveLocalStorage();
+        return;
+      }
+    }
+    if ([')', '}', ']'].includes(e.key)) {
+      const start = taLeft.selectionStart;
+      if (taLeft.selectionStart === taLeft.selectionEnd && taLeft.value[start] === e.key) {
+        e.preventDefault();
+        taLeft.selectionStart = taLeft.selectionEnd = start + 1;
+        return;
+      }
+    }
+  });
+
   taLeft.addEventListener('input', () => {
     const f = getActiveFile();
     if (f) f.content = taLeft.value;
     updateCodeStats();
+    scheduleSaveLocalStorage();
     if (CONFIG.autoRun) runCodeOnCppServer();
   });
 }
@@ -1041,17 +1845,59 @@ function setupEventListeners() {
     runCodeOnCppServer();
   });
 
-  // Keyboard shortcut: Ctrl+Enter / Cmd+Enter to Run
+  // Keyboard shortcuts (Run, Save, Open, Comment, Format)
   window.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       e.preventDefault();
       runCodeOnCppServer();
     }
-    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
       e.preventDefault();
-      showToast('Source code saved in memory');
+      saveActiveFile();
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'o' || e.key === 'O')) {
+      e.preventDefault();
+      openFileFromDisk();
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === '/' || e.code === 'Slash')) {
+      e.preventDefault();
+      toggleCommentOnEditor();
+    }
+    if ((e.shiftKey && e.altKey && (e.key === 'f' || e.key === 'F')) ||
+        ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'i' || e.key === 'I'))) {
+      e.preventDefault();
+      formatCurrentFile();
     }
   });
+
+  // Toolbar action buttons
+  const btnSaveSrc = document.getElementById('btn-save-src');
+  if (btnSaveSrc) {
+    btnSaveSrc.addEventListener('click', () => {
+      saveActiveFile();
+    });
+  }
+
+  const btnOpenSrc = document.getElementById('btn-open-src');
+  if (btnOpenSrc) {
+    btnOpenSrc.addEventListener('click', () => {
+      openFileFromDisk();
+    });
+  }
+
+  const btnFormatSrc = document.getElementById('btn-format-src');
+  if (btnFormatSrc) {
+    btnFormatSrc.addEventListener('click', () => {
+      formatCurrentFile();
+    });
+  }
+
+  const btnCommentSrc = document.getElementById('btn-comment-src');
+  if (btnCommentSrc) {
+    btnCommentSrc.addEventListener('click', () => {
+      toggleCommentOnEditor();
+    });
+  }
 
   // Clear button: empties active file editor
   const btnClear = document.getElementById('btn-clear');
@@ -1062,6 +1908,7 @@ function setupEventListeners() {
       if (editorLeft) {
         if (editorLeft.setValue) editorLeft.setValue('');
         if (editorLeft.focus) editorLeft.focus();
+        scheduleSaveLocalStorage(true);
         showToast(`Cleared ${activeFile.name}!`);
       }
     });
@@ -1076,6 +1923,7 @@ function setupEventListeners() {
       CONFIG.serverUrl = e.target.value.trim();
       const endpointVal = endpointDisplay ? endpointDisplay.querySelector('.endpoint-val') : null;
       if (endpointVal) endpointVal.textContent = CONFIG.serverUrl;
+      saveConfigToLocalStorage();
       showToast(`Compiler server endpoint set to ${CONFIG.serverUrl}`);
       checkServerHealth();
     });
@@ -1088,8 +1936,10 @@ function setupEventListeners() {
   // Request format select (JSON vs raw text)
   const formatSelect = document.getElementById('request-format-select');
   if (formatSelect) {
+    formatSelect.value = CONFIG.requestFormat;
     formatSelect.addEventListener('change', (e) => {
       CONFIG.requestFormat = e.target.value;
+      saveConfigToLocalStorage();
       showToast(`Request format set to: ${CONFIG.requestFormat}`);
     });
   }
@@ -1100,9 +1950,10 @@ function setupEventListeners() {
       const newUrl = prompt('Enter compiler server endpoint URL:', CONFIG.serverUrl);
       if (newUrl && newUrl.trim()) {
         CONFIG.serverUrl = newUrl.trim();
-        serverInput.value = CONFIG.serverUrl;
+        if (serverInput) serverInput.value = CONFIG.serverUrl;
         const endpointVal = endpointDisplay.querySelector('.endpoint-val');
         if (endpointVal) endpointVal.textContent = CONFIG.serverUrl;
+        saveConfigToLocalStorage();
         showToast(`Compiler server endpoint set to ${CONFIG.serverUrl}`);
       }
     });
@@ -1111,8 +1962,10 @@ function setupEventListeners() {
   // Auto-run toggle
   const autoRunToggle = document.getElementById('auto-run-toggle');
   if (autoRunToggle) {
+    autoRunToggle.checked = CONFIG.autoRun;
     autoRunToggle.addEventListener('change', (e) => {
       CONFIG.autoRun = e.target.checked;
+      saveConfigToLocalStorage();
       showToast(CONFIG.autoRun ? 'Auto-run enabled on typing' : 'Auto-run disabled');
     });
   }
@@ -1120,8 +1973,10 @@ function setupEventListeners() {
   // Sync scroll toggle
   const syncToggle = document.getElementById('sync-scroll-toggle');
   if (syncToggle) {
+    syncToggle.checked = CONFIG.syncScroll;
     syncToggle.addEventListener('change', (e) => {
       CONFIG.syncScroll = e.target.checked;
+      saveConfigToLocalStorage();
     });
   }
 
@@ -1155,6 +2010,7 @@ function setupEventListeners() {
         if (editorLeft && editorLeft.setValue) {
           editorLeft.setValue(activeFile.content);
         }
+        scheduleSaveLocalStorage(true);
         showToast(`Loaded sample: ${link.textContent.trim()}`);
         document.querySelectorAll('.dropdown.open').forEach(d => d.classList.remove('open'));
       }
@@ -1191,6 +2047,7 @@ function setupEventListeners() {
   // Font size buttons
   const changeFontSize = (delta) => {
     CONFIG.fontSize = Math.min(24, Math.max(10, CONFIG.fontSize + delta));
+    saveConfigToLocalStorage();
     if (editorLeft && editorLeft.updateOptions) editorLeft.updateOptions({ fontSize: CONFIG.fontSize });
     if (editorRight && editorRight.updateOptions) editorRight.updateOptions({ fontSize: CONFIG.fontSize });
   };
@@ -1213,7 +2070,6 @@ function setupEventListeners() {
 
   if (drawerResizer && drawer) {
     drawerResizer.addEventListener('mousedown', (e) => {
-      // Only start drag on left mouse button
       if (e.button !== 0) return;
       e.preventDefault();
       e.stopPropagation();
@@ -1222,11 +2078,9 @@ function setupEventListeners() {
       drawerResizer.classList.add('dragging');
       startDragY = e.clientY;
 
-      // Capture current actual rendered height (not saved height)
       const currentHeight = drawer.offsetHeight;
       startDrawerHeight = currentHeight > 38 ? currentHeight : savedDrawerHeight;
 
-      // Ensure drawer is open and frozen at its current pixel height before drag
       drawer.classList.remove('closed');
       drawer.style.height = `${startDrawerHeight}px`;
       drawer.style.transition = 'none';
@@ -1259,6 +2113,12 @@ function setupEventListeners() {
         document.body.style.userSelect = '';
         if (editorLeft && editorLeft.layout) editorLeft.layout();
         if (editorRight && editorRight.layout) editorRight.layout();
+        try {
+          localStorage.setItem('agc_drawer_state', JSON.stringify({
+            closed: drawer.classList.contains('closed'),
+            height: savedDrawerHeight
+          }));
+        } catch (_) { }
       }
     });
   }
@@ -1272,6 +2132,12 @@ function setupEventListeners() {
       drawer.classList.add('closed');
       drawer.style.height = '';
     }
+    try {
+      localStorage.setItem('agc_drawer_state', JSON.stringify({
+        closed: drawer.classList.contains('closed'),
+        height: savedDrawerHeight
+      }));
+    } catch (_) { }
     setTimeout(() => {
       if (editorLeft && editorLeft.layout) editorLeft.layout();
       if (editorRight && editorRight.layout) editorRight.layout();
@@ -1279,7 +2145,6 @@ function setupEventListeners() {
   };
 
   if (drawerToggle) drawerToggle.addEventListener('click', (e) => {
-    // Don't toggle if user grabbed the resizer handle
     if (e.target.closest('.drawer-resizer')) return;
     if (e.target.closest('#btn-clear-logs')) return;
     if (e.target.closest('#btn-collapse-toggle')) {
@@ -1299,6 +2164,11 @@ function setupEventListeners() {
       if (count) count.textContent = '0 messages';
     });
   }
+
+  // Ensure state is saved when unloading page
+  window.addEventListener('beforeunload', () => {
+    saveToLocalStorage();
+  });
 }
 
 function downloadFile(filename, content) {
@@ -1318,6 +2188,43 @@ function downloadFile(filename, content) {
 // 8. ON DOM READY
 // ============================================================================
 document.addEventListener('DOMContentLoaded', () => {
+  // Restore Splitter position if saved
+  try {
+    const savedSplitter = localStorage.getItem('agc_splitter_pos');
+    if (savedSplitter) {
+      const leftPct = parseFloat(savedSplitter);
+      if (!isNaN(leftPct) && leftPct > 10 && leftPct < 90) {
+        const paneLeft = document.getElementById('pane-left');
+        const paneRight = document.getElementById('pane-right');
+        if (paneLeft && paneRight) {
+          paneLeft.style.flex = `0 0 ${leftPct}%`;
+          paneRight.style.flex = `0 0 ${100 - leftPct}%`;
+        }
+      }
+    }
+  } catch (_) { }
+
+  // Restore Drawer state if saved
+  try {
+    const savedDrawer = localStorage.getItem('agc_drawer_state');
+    if (savedDrawer) {
+      const dState = JSON.parse(savedDrawer);
+      const drawer = document.getElementById('console-drawer');
+      if (drawer && dState) {
+        if (dState.height && dState.height > 32) {
+          savedDrawerHeight = dState.height;
+        }
+        if (dState.closed === false) {
+          drawer.classList.remove('closed');
+          drawer.style.height = `${dState.height || 180}px`;
+        } else {
+          drawer.classList.add('closed');
+          drawer.style.height = '';
+        }
+      }
+    }
+  } catch (_) { }
+
   applyTheme(currentTheme);
   initSplitter();
   setupEventListeners();
